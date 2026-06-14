@@ -1,0 +1,7 @@
+*.user
+*.suo
+*.sln
+bin/
+obj/
+*.log
+gen.ps1

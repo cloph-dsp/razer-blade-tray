@@ -1,6 +1,7 @@
-// RazerTray.cs - Razer Blade Tray Controller v4
+// RazerTray.cs - Razer Blade Tray Controller v5
 // System tray icon - switches performance modes (Balanced/Gaming/Creator)
 // + Windows power plan + dynamic icon + temps + game detection
+// + file logging + state persistence + sleep/resume + auto fan curve
 //
 // Uses libusb-1.0.dll for USB HID control transfers with the CORRECT
 // packet format reverse-engineered from librazerblade (Meetem/librazerblade).
@@ -28,6 +29,7 @@ using System.Text;
 using Thread = System.Threading.Thread;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace RazerTray
 {
@@ -614,6 +616,96 @@ namespace RazerTray
     }
 
     // -----------------------------------------------------------------------
+    // AppLogger: Simple file logging
+    // -----------------------------------------------------------------------
+    class AppLogger
+    {
+        string _logPath;
+        object _lock = new object();
+
+        public AppLogger(string logPath)
+        {
+            _logPath = logPath;
+        }
+
+        public void Log(string message)
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message;
+                    File.AppendAllText(_logPath, line + Environment.NewLine);
+                }
+            }
+            catch { }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PersistedState: JSON state serialization
+    // -----------------------------------------------------------------------
+    class PersistedState
+    {
+        public string Mode { get; set; }
+        public int FanSpeed0 { get; set; }
+        public int FanSpeed1 { get; set; }
+        public bool BoostEnabled { get; set; }
+        public bool AutoFanCurve { get; set; }
+        public bool ManualOverride { get; set; }
+        public bool GameDetectionEnabled { get; set; }
+
+        string _statePath;
+
+        public PersistedState(string statePath)
+        {
+            _statePath = statePath;
+        }
+
+        public PersistedState Load()
+        {
+            try
+            {
+                if (File.Exists(_statePath))
+                {
+                    string json = File.ReadAllText(_statePath);
+                    var serializer = new JavaScriptSerializer();
+                    return serializer.Deserialize<PersistedState>(json);
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                var serializer = new JavaScriptSerializer();
+                string json = serializer.Serialize(this);
+                File.WriteAllText(_statePath, json);
+            }
+            catch { }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FanCurveController: temperature-based auto fan curve
+    // -----------------------------------------------------------------------
+    class FanCurveController
+    {
+        // Curve: <45C->3500, <55C->4000, <65C->4500, <75C->5000, >=75C->5300
+        public ushort GetTargetRpm(float cpuTemp)
+        {
+            if (cpuTemp < 45) return 3500;
+            if (cpuTemp < 55) return 4000;
+            if (cpuTemp < 65) return 4500;
+            if (cpuTemp < 75) return 5000;
+            return 5300;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // TrayContext: System tray icon + full application logic
     // -----------------------------------------------------------------------
     class TrayContext : ApplicationContext
@@ -663,6 +755,21 @@ namespace RazerTray
         ToolStripMenuItem _fanCustom;
         ToolStripMenuItem _boostItem;
         ToolStripMenuItem _gameDetectionItem;
+        ToolStripMenuItem _fanAutoCurveItem;
+
+        // App dir (for log, state, config files)
+        string _appDir;
+
+        // Logger
+        AppLogger _logger;
+
+        // Persisted state
+        PersistedState _state;
+
+        // Auto fan curve
+        FanCurveController _curveCtrl;
+        bool _autoFanCurveEnabled = false;
+        Timer _fanCurveTimer;
 
         // ---- Constructor ----
         public TrayContext()
@@ -672,10 +779,17 @@ namespace RazerTray
             _powerMgr = new PowerPlanManager();
             _tempMon = new TemperatureMonitor();
 
-            string configDir = Path.GetDirectoryName(
+            _appDir = Path.GetDirectoryName(
                 System.Reflection.Assembly.GetExecutingAssembly().Location);
+
+            // Logger, state, curve
+            _logger = new AppLogger(Path.Combine(_appDir, "RazerTray.log"));
+            _logger.Log("Starting RazerTray v5");
+            _state = new PersistedState(Path.Combine(_appDir, "RazerTray.state")).Load();
+            if (_state != null) ApplyState();
+            _curveCtrl = new FanCurveController();
             _gameDetector = new GameDetector(
-                Path.Combine(configDir, "game-modes.config"));
+                Path.Combine(_appDir, "game-modes.config"));
 
             _fanHistory = new Dictionary<int, Queue<ushort>>();
             _fanHistory[0] = new Queue<ushort>(MaxFanHistory);
@@ -708,6 +822,14 @@ namespace RazerTray
             var tempTimer = new Timer { Interval = 10000 };
             tempTimer.Tick += (s, e) => TempTimerTick();
             tempTimer.Start();
+
+            // Auto fan curve timer (5s)
+            _fanCurveTimer = new Timer { Interval = 5000 };
+            _fanCurveTimer.Tick += (s, e) => FanCurveTick();
+            _fanCurveTimer.Start();
+
+            // Sleep/Resume handler
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
         }
 
         // ---- Build context menu ----
@@ -748,6 +870,13 @@ namespace RazerTray
             _gameDetectionItem = new ToolStripMenuItem("Game Detection", null, (s, e) => ToggleGameDetection());
             _gameDetectionItem.Checked = _gameDetectionEnabled;
             _menu.Items.Add(_gameDetectionItem);
+
+            // --- Auto Fan Curve toggle ---
+            _fanAutoCurveItem = new ToolStripMenuItem("Auto Fan Curve", null, (s, e) => ToggleAutoFanCurve());
+            _menu.Items.Add(_fanAutoCurveItem);
+
+            // --- Open Config ---
+            _menu.Items.Add(new ToolStripMenuItem("Open Config...", null, (s, e) => OpenConfigFile()));
 
             // --- Reload Config ---
             _menu.Items.Add(new ToolStripMenuItem("Reload Config", null, (s, e) => ReloadConfig()));
@@ -913,6 +1042,9 @@ namespace RazerTray
         {
             if (!_device.IsConnected) return;
 
+            // Manual fan set disables auto fan curve
+            _autoFanCurveEnabled = false;
+
             if (rpm == 0)
             {
                 // Auto (EC control)
@@ -1009,6 +1141,7 @@ namespace RazerTray
         // ---- Exit ----
         void ExitApp()
         {
+            SaveState();
             _trayIcon.Visible = false;
             if (_device.IsConnected)
             {
@@ -1017,6 +1150,146 @@ namespace RazerTray
             }
             _device.Dispose();
             Application.Exit();
+        }
+
+        // ================================================================
+        // v5: State persistence, auto fan curve, sleep/resume
+        // ================================================================
+
+        // ---- Apply persisted state after loading ----
+        void ApplyState()
+        {
+            try
+            {
+                if (_state == null) return;
+                if (!string.IsNullOrEmpty(_state.Mode))
+                {
+                    PowerMode mode;
+                    if (Enum.TryParse<PowerMode>(_state.Mode, out mode))
+                    {
+                        _currentMode = mode;
+                    }
+                }
+                if (_state.FanSpeed0 > 0) _fanSpeed0 = (ushort)_state.FanSpeed0;
+                if (_state.FanSpeed1 > 0) _fanSpeed1 = (ushort)_state.FanSpeed1;
+                _boostEnabled = _state.BoostEnabled;
+                _autoFanCurveEnabled = _state.AutoFanCurve;
+                _isManualOverride = _state.ManualOverride;
+                _gameDetectionEnabled = _state.GameDetectionEnabled;
+            }
+            catch { }
+        }
+
+        // ---- Save current state to file ----
+        void SaveState()
+        {
+            try
+            {
+                if (_state == null)
+                    _state = new PersistedState(Path.Combine(_appDir, "RazerTray.state"));
+                _state.Mode = _currentMode.ToString();
+                _state.FanSpeed0 = _fanSpeed0;
+                _state.FanSpeed1 = _fanSpeed1;
+                _state.BoostEnabled = _boostEnabled;
+                _state.AutoFanCurve = _autoFanCurveEnabled;
+                _state.ManualOverride = _isManualOverride;
+                _state.GameDetectionEnabled = _gameDetectionEnabled;
+                _state.Save();
+            }
+            catch { }
+        }
+
+        // ---- Open config file in Notepad ----
+        void OpenConfigFile()
+        {
+            try
+            {
+                string configPath = Path.Combine(_appDir, "game-modes.config");
+                Process.Start("notepad.exe", configPath);
+            }
+            catch { }
+        }
+
+        // ---- Auto fan curve tick ----
+        void FanCurveTick()
+        {
+            try
+            {
+                if (!_autoFanCurveEnabled) return;
+                if (!_device.IsConnected) return;
+                if (_cpuTemp <= 0) return; // no temp data yet
+
+                ushort target = _curveCtrl.GetTargetRpm(_cpuTemp);
+
+                // Only set if different from current
+                if (_fanSpeed0 != target || _fanSpeed1 != target)
+                {
+                    _device.SetFanSpeed(0, target);
+                    _device.SetFanSpeed(1, target);
+                    _fanSpeed0 = target;
+                    _fanSpeed1 = target;
+                    _logger.Log("FanCurve: CPU=" + _cpuTemp.ToString("F0") + "C -> " + target + " RPM");
+                }
+            }
+            catch { }
+        }
+
+        // ---- Sleep / Resume handler ----
+        void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            try
+            {
+                if (e.Mode == PowerModes.Resume)
+                {
+                    _logger.Log("System resume");
+                    // Reconnect USB
+                    _device.Disconnect();
+                    _device.Connect();
+                    // Reapply current mode
+                    if (_device.IsConnected)
+                    {
+                        _device.SetPowerMode(_currentMode, autoFan: true);
+                        _logger.Log("Resume: reapplied mode " + _currentMode);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // ---- Toggle auto fan curve ----
+        void ToggleAutoFanCurve()
+        {
+            _autoFanCurveEnabled = !_autoFanCurveEnabled;
+            if (!_autoFanCurveEnabled)
+            {
+                // Restore EC auto fan control
+                _device.SetPowerMode(_currentMode, autoFan: true);
+                _logger.Log("AutoFanCurve: disabled (EC auto restored)");
+            }
+            else
+            {
+                _logger.Log("AutoFanCurve: enabled");
+            }
+            UpdateFanMenuState();
+            UpdateTooltip();
+        }
+
+        // ---- Enable/disable fan menu items based on auto fan curve state ----
+        void UpdateFanMenuState()
+        {
+            try
+            {
+                if (_fan3500 == null) return;
+                bool fanEnabled = !_autoFanCurveEnabled;
+                _fan3500.Enabled = fanEnabled;
+                _fan4000.Enabled = fanEnabled;
+                _fan4500.Enabled = fanEnabled;
+                _fan5000.Enabled = fanEnabled;
+                _fanAuto.Enabled = fanEnabled;
+                _fanCustom.Enabled = fanEnabled;
+                _fanAutoCurveItem.Checked = _autoFanCurveEnabled;
+            }
+            catch { }
         }
 
         // ================================================================
@@ -1048,6 +1321,7 @@ namespace RazerTray
                 _modeCreator.Checked = (_currentMode == PowerMode.Creator);
                 _boostItem.Checked = _boostEnabled;
 
+                UpdateFanMenuState();
                 UpdateTooltip();
             }
             catch { }
@@ -1111,6 +1385,7 @@ namespace RazerTray
                 _cpuTemp = _tempMon.GetCpuTemperature();
                 _gpuTemp = _tempMon.GetGpuTemperature();
                 _lastTempRead = DateTime.Now;
+                FanCurveTick();
                 UpdateTooltip();
             }
             catch { }
@@ -1121,6 +1396,8 @@ namespace RazerTray
         {
             if (disposing)
             {
+                SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+                if (_fanCurveTimer != null) { _fanCurveTimer.Dispose(); _fanCurveTimer = null; }
                 if (_currentIcon != null) { _currentIcon.Dispose(); _currentIcon = null; }
                 if (_iconBitmap != null) { _iconBitmap.Dispose(); _iconBitmap = null; }
                 if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; }

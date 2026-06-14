@@ -800,37 +800,33 @@ namespace RazerTray
         {
             if (_trayIcon == null) return;
 
+            // NotifyIcon.Text is limited to 63 chars on Windows
             StringBuilder sb = new StringBuilder();
-            sb.Append("Razer Blade Tray");
-            sb.AppendLine();
-
-            sb.Append("Mode: ");
             sb.Append(_currentMode.ToString());
-            if (_boostEnabled) sb.Append(" [Boost]");
-            sb.AppendLine();
+            if (_boostEnabled) sb.Append("+Boost");
+            sb.Append(' ');
 
             if (_device.IsConnected)
             {
-                sb.AppendFormat("Fan1: {0} RPM", _fanSpeed0);
-                sb.AppendLine();
-                sb.AppendFormat("Fan2: {0} RPM", _fanSpeed1);
-                sb.AppendLine();
+                sb.AppendFormat("F1:{0}F2:{1} ", _fanSpeed0, _fanSpeed1);
             }
             else
             {
-                sb.AppendLine("USB: Disconnected");
+                sb.Append("USB:Disc ");
             }
 
             if (_cpuTemp > 0)
-                sb.AppendFormat("CPU: {0:F0}°C  ", _cpuTemp);
+                sb.AppendFormat("CPU:{0:F0}C ", _cpuTemp);
             if (_gpuTemp > 0)
-                sb.AppendFormat("GPU: {0:F0}°C", _gpuTemp);
-            if (_cpuTemp > 0 || _gpuTemp > 0) sb.AppendLine();
+                sb.AppendFormat("GPU:{0:F0}C", _gpuTemp);
 
             if (_gameModeActive)
-                sb.AppendLine("Game Mode Active");
+                sb.Append(" *Game*");
 
-            _trayIcon.Text = sb.ToString().TrimEnd();
+            string text = sb.ToString().TrimEnd();
+            if (text.Length > 63)
+                text = text.Substring(0, 60) + "...";
+            _trayIcon.Text = text;
         }
 
         // ---- Mode sync from Windows power plan ----

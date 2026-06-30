@@ -4,4 +4,9 @@
 bin/
 obj/
 *.log
+*.state
 gen.ps1
+RazerTray-new.exe
+game-modes.config
+!.gitignore
+!game-modes.config.example

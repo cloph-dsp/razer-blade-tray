@@ -1,7 +1,11 @@
-// RazerTray.cs - Razer Blade Tray Controller v5
+// RazerTray.cs - Razer Blade Tray Controller v5.1
 // System tray icon - switches performance modes (Balanced/Gaming/Creator)
 // + Windows power plan + dynamic icon + temps + game detection
 // + file logging + state persistence + sleep/resume + auto fan curve
+// + auto-start + process management + NVAPI GPU control
+//
+// Repository: https://github.com/cloph-dsp/razertray
+// License: MIT
 //
 // Uses libusb-1.0.dll for USB HID control transfers with the CORRECT
 // packet format reverse-engineered from librazerblade (Meetem/librazerblade).
@@ -38,9 +42,18 @@ namespace RazerTray
         [STAThread]
         static void Main()
         {
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new TrayContext());
+            // Single-instance guard (avoids duplication from admin-elevation
+            // double-launch on startup)
+            bool createdNew;
+            using (var mutex = new System.Threading.Mutex(true,
+                "Global\\RazerBladeTray-0e8a7f35-9c12-4f1a-b123-8ec3b5f2d901",
+                out createdNew))
+            {
+                if (!createdNew) return;
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new TrayContext());
+            }
         }
     }
 
@@ -317,20 +330,6 @@ namespace RazerTray
             catch { return 0; }
         }
 
-        // ---- Boost (software tracking only - 0x070f not supported on this model) ----
-        bool _boostEnabled = false;
-
-        public bool SetBoost(bool enabled)
-        {
-            _boostEnabled = enabled;
-            return true;
-        }
-
-        public bool QueryBoost()
-        {
-            return _boostEnabled;
-        }
-
         // ---- Combo: set mode + optionally restore auto fan ----
         public bool SetModeWithFan(PowerMode mode, bool autoFan = true, ushort? fanRpm = null)
         {
@@ -419,6 +418,7 @@ namespace RazerTray
         public static readonly Guid GUID_BALANCED = new Guid("381b4222-f694-41f0-9685-ff5bb260df2e");
         public static readonly Guid GUID_HIGH_PERFORMANCE = new Guid("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c");
         public static readonly Guid GUID_POWER_SAVER = new Guid("a1841308-3541-4fab-bc81-f71556f20b4a");
+        public static readonly Guid GUID_BITSUM_HIGH_PERF = new Guid("dd7348fa-b3ba-4af1-b0d1-8b32566769d8");
 
         // Returns GUID of currently active plan
         public Guid CurrentPlanGuid()
@@ -471,10 +471,59 @@ namespace RazerTray
             switch (mode)
             {
                 case PowerMode.Balanced: return GUID_BALANCED;
-                case PowerMode.Gaming: return GUID_HIGH_PERFORMANCE;
-                case PowerMode.Creator: return GUID_BALANCED; // Creator uses Balanced plan
+                case PowerMode.Gaming: return GUID_BITSUM_HIGH_PERF; // Bitsum Highest Performance
+                case PowerMode.Creator: return GUID_BALANCED;
                 default: return GUID_BALANCED;
             }
+        }
+
+        // ---- Power saving subparameter overrides (CPU, PCIe, disk) ----
+        static void RunPowerCfg(string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("powercfg", args)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    p.WaitForExit(3000);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Apply power-saving subparameter overrides on the active plan.
+        /// Disables turbo boost, maxes PCIe ASPM, sets disk timeout.
+        /// </summary>
+        public static void ApplyPowerSaver()
+        {
+            // CPU max 99% — disables turbo boost
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 99");
+            // CPU min 5%
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 5");
+            // PCIe ASPM maximum savings (2 = MaxPowerSavings)
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PCIEXPRESS ASPM 2");
+            // Disk timeout 10 minutes
+            RunPowerCfg("-change -disk-timeout-ac 10");
+        }
+
+        /// <summary>
+        /// Restore normal subparameter values on the active plan.
+        /// </summary>
+        public static void RemovePowerSaver()
+        {
+            // CPU max 100% — re-enable turbo boost
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100");
+            // CPU min 5%
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 5");
+            // PCIe ASPM moderate (1 = ModerateSavings)
+            RunPowerCfg("-setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PCIEXPRESS ASPM 1");
+            // No disk timeout
+            RunPowerCfg("-change -disk-timeout-ac 0");
         }
     }
 
@@ -491,14 +540,347 @@ namespace RazerTray
     }
 
     // -----------------------------------------------------------------------
+    // NativeProcess: P/Invoke for process priority/Io/power-throttling
+    // -----------------------------------------------------------------------
+    static class NativeProcess
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetProcessInformation(IntPtr hProcess,
+            int ProcessInformationClass, IntPtr ProcessInformation, int ProcessInformationSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        // ProcessInformationClass constants
+        public const int ProcessPowerThrottling = 29;
+        public const int ProcessIoPriority = 33;
+
+        // Access flags
+        public const uint PROCESS_SET_INFORMATION = 0x0200;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        public const uint PROCESS_SET_LIMITED_INFORMATION = 0x2000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_POWER_THROTTLING_STATE
+        {
+            public uint Version;       // 1
+            public uint ControlMask;   // bitmask of flags to control
+            public uint StateMask;     // bitmask of flags to enable
+        }
+
+        public const uint PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 1;
+        public const uint PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 4;
+    }
+
+    // -----------------------------------------------------------------------
+    // ProcessRule: describes settings to apply to a process
+    // -----------------------------------------------------------------------
+    class ProcessRule
+    {
+        public string Exe { get; set; }              // "bitwig studio.exe"
+        public ProcessPriorityClass? Priority { get; set; }
+        public int? IoPriority { get; set; }         // 0=VeryLow 1=Low 2=Normal 3=High
+        public IntPtr? AffinityMask { get; set; }
+        public bool NoPowerThrottling { get; set; }
+        public string ModeHint { get; set; }         // "Audio" or "Game" for power mode hint
+    }
+
+    // -----------------------------------------------------------------------
+    // ProcessManager: applies priority/IO/affinity/power-throttle to processes
+    // -----------------------------------------------------------------------
+    class ProcessManager : IDisposable
+    {
+        // Built-in system rules (shipped with the app, not user-configurable)
+        static readonly List<ProcessRule> SystemRules = new List<ProcessRule>
+        {
+            new ProcessRule {
+                Exe = "bitwig studio.exe", Priority = ProcessPriorityClass.RealTime,
+                IoPriority = 3, AffinityMask = new IntPtr(0xFFD), // skip core 1
+                NoPowerThrottling = true, ModeHint = "Audio"
+            },
+            new ProcessRule {
+                Exe = "bitwigaudioengine-x64-avx2.exe", Priority = ProcessPriorityClass.High,
+                IoPriority = 3, AffinityMask = new IntPtr(0xFFD),
+                NoPowerThrottling = true, ModeHint = "Audio"
+            },
+            new ProcessRule {
+                Exe = "bitwigpluginhost-x64-sse41.exe", Priority = ProcessPriorityClass.High,
+                IoPriority = 3, NoPowerThrottling = true, ModeHint = "Audio"
+            },
+            new ProcessRule {
+                Exe = "bitwigpluginhost-x86-sse41.exe", Priority = ProcessPriorityClass.High,
+                IoPriority = 3, NoPowerThrottling = true, ModeHint = "Audio"
+            },
+            new ProcessRule {
+                Exe = "audiodg.exe", Priority = ProcessPriorityClass.High,
+                IoPriority = 3, NoPowerThrottling = true, ModeHint = "Audio"
+            },
+            new ProcessRule {
+                Exe = "cortexlauncherservice.exe", Priority = ProcessPriorityClass.BelowNormal,
+                ModeHint = null
+            },
+        };
+
+        // User rules derived from game-modes.config
+        List<ProcessRule> _userRules = new List<ProcessRule>();
+        object _userRulesLock = new object();
+
+        // Cache of recently applied (pid, timestamp) to avoid hammering
+        Dictionary<int, DateTime> _applied = new Dictionary<int, DateTime>();
+        const int CacheSeconds = 10;
+
+        System.Threading.Timer _timer;
+        AppLogger _logger;
+        bool _disposed;
+
+        public ProcessManager(AppLogger logger)
+        {
+            _logger = logger;
+        }
+
+        public void Start()
+        {
+            _timer = new System.Threading.Timer(Tick, null, 5000, 5000);
+        }
+
+        public void SetUserRules(List<GameConfig> games)
+        {
+            lock (_userRulesLock)
+            {
+                _userRules.Clear();
+                if (games == null) return;
+                foreach (var g in games)
+                {
+                    var rule = new ProcessRule { Exe = g.exe };
+                    if (!string.IsNullOrEmpty(g.priority))
+                    {
+                        switch (g.priority.ToLowerInvariant())
+                        {
+                            case "real time": rule.Priority = ProcessPriorityClass.RealTime; break;
+                            case "high":      rule.Priority = ProcessPriorityClass.High; break;
+                            case "above normal": rule.Priority = ProcessPriorityClass.AboveNormal; break;
+                            case "normal":    rule.Priority = ProcessPriorityClass.Normal; break;
+                            case "below normal": rule.Priority = ProcessPriorityClass.BelowNormal; break;
+                            case "idle":      rule.Priority = ProcessPriorityClass.Idle; break;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(g.ioPriority))
+                    {
+                        switch (g.ioPriority.ToLowerInvariant())
+                        {
+                            case "high":     rule.IoPriority = 3; break;
+                            case "normal":   rule.IoPriority = 2; break;
+                            case "low":      rule.IoPriority = 1; break;
+                            case "very low": rule.IoPriority = 0; break;
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(g.cpuAffinity))
+                    {
+                        rule.AffinityMask = ParseAffinity(g.cpuAffinity);
+                    }
+                    rule.NoPowerThrottling = g.noPowerThrottling;
+                    if (g.mode != null && g.mode.IndexOf("Audio", StringComparison.OrdinalIgnoreCase) >= 0)
+                        rule.ModeHint = "Audio";
+                    else if (g.mode != null && g.mode.IndexOf("Game", StringComparison.OrdinalIgnoreCase) >= 0)
+                        rule.ModeHint = "Game";
+                    _userRules.Add(rule);
+                }
+            }
+        }
+
+        static IntPtr ParseAffinity(string spec)
+        {
+            try
+            {
+                // "0,2-11" style: comma-separated numbers or ranges
+                ulong mask = 0;
+                var parts = spec.Split(',');
+                foreach (var p in parts)
+                {
+                    var trimmed = p.Trim();
+                    if (trimmed.Contains('-'))
+                    {
+                        var range = trimmed.Split('-');
+                        int start = int.Parse(range[0].Trim());
+                        int end = int.Parse(range[1].Trim());
+                        for (int i = start; i <= end; i++)
+                            mask |= (1UL << i);
+                    }
+                    else
+                    {
+                        int cpu = int.Parse(trimmed);
+                        mask |= (1UL << cpu);
+                    }
+                }
+                return new IntPtr((long)mask);
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        void Tick(object state)
+        {
+            try
+            {
+                // Collect all rules
+                var allRules = new List<ProcessRule>(SystemRules);
+                lock (_userRulesLock)
+                    allRules.AddRange(_userRules);
+
+                // Group by exe for efficient lookup
+                var byExe = new Dictionary<string, List<ProcessRule>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var r in allRules)
+                {
+                    if (string.IsNullOrEmpty(r.Exe)) continue;
+                    if (!byExe.ContainsKey(r.Exe))
+                        byExe[r.Exe] = new List<ProcessRule>();
+                    byExe[r.Exe].Add(r);
+                }
+
+                // Scan all processes once
+                Process[] procs;
+                try { procs = Process.GetProcesses(); }
+                catch { return; }
+
+                foreach (var proc in procs)
+                {
+                    try
+                    {
+                        string exeName = proc.ProcessName + ".exe";
+                        List<ProcessRule> rules;
+                        if (!byExe.TryGetValue(exeName, out rules)) continue;
+
+                        // Skip if recently applied for this PID
+                        if (_applied.ContainsKey(proc.Id) &&
+                            (DateTime.Now - _applied[proc.Id]).TotalSeconds < CacheSeconds)
+                            continue;
+
+                        foreach (var rule in rules)
+                        {
+                            ApplyToProcess(proc, rule);
+                        }
+                        _applied[proc.Id] = DateTime.Now;
+
+                        // Clean stale cache
+                        var stale = _applied.Where(kv => (DateTime.Now - kv.Value).TotalSeconds > CacheSeconds * 3).Select(kv => kv.Key).ToList();
+                        foreach (var k in stale) _applied.Remove(k);
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { proc.Dispose(); } catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        void ApplyToProcess(Process proc, ProcessRule rule)
+        {
+            try
+            {
+                if (rule.Priority.HasValue)
+                {
+                    proc.PriorityClass = rule.Priority.Value;
+                }
+            }
+            catch { /* access denied etc - normal for system processes */ }
+
+            // I/O priority and power throttling need OpenProcess with extra rights
+            try
+            {
+                uint access = NativeProcess.PROCESS_SET_INFORMATION;
+                if (rule.IoPriority.HasValue) access |= NativeProcess.PROCESS_SET_INFORMATION;
+                if (rule.NoPowerThrottling) access |= NativeProcess.PROCESS_SET_LIMITED_INFORMATION;
+
+                IntPtr hProc = NativeProcess.OpenProcess(access, false, (uint)proc.Id);
+                if (hProc == IntPtr.Zero) return;
+
+                try
+                {
+                    if (rule.IoPriority.HasValue)
+                    {
+                        int ioPrio = rule.IoPriority.Value;
+                        int cb = Marshal.SizeOf(ioPrio);
+                        IntPtr ptr = Marshal.AllocHGlobal(cb);
+                        try
+                        {
+                            Marshal.StructureToPtr(ioPrio, ptr, false);
+                            NativeProcess.SetProcessInformation(hProc,
+                                NativeProcess.ProcessIoPriority, ptr, cb);
+                        }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                    }
+
+                    if (rule.NoPowerThrottling)
+                    {
+                        var state = new NativeProcess.PROCESS_POWER_THROTTLING_STATE
+                        {
+                            Version = 1,
+                            ControlMask = NativeProcess.PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                            StateMask = 0 // 0 = disable throttling
+                        };
+                        int cb = Marshal.SizeOf(state);
+                        IntPtr ptr = Marshal.AllocHGlobal(cb);
+                        try
+                        {
+                            Marshal.StructureToPtr(state, ptr, false);
+                            NativeProcess.SetProcessInformation(hProc,
+                                NativeProcess.ProcessPowerThrottling, ptr, cb);
+                        }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                    }
+
+                    // Set affinity (requires PROCESS_SET_INFORMATION)
+                    if (rule.AffinityMask.HasValue && rule.AffinityMask.Value != IntPtr.Zero)
+                    {
+                        try { proc.ProcessorAffinity = rule.AffinityMask.Value; }
+                        catch { }
+                    }
+                }
+                finally
+                {
+                    NativeProcess.CloseHandle(hProc);
+                }
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                _disposed = true;
+                if (_timer != null) { _timer.Dispose(); _timer = null; }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // GameDetector: reads game-modes.config, detects running games
     // -----------------------------------------------------------------------
+    class GpuProfileConfig
+    {
+        // Power management mode: null=no change, 0=Adaptive, 1=PreferMax
+        public int? gpuPowerMode { get; set; }
+        // Optimus rendering mode: null=no change, 0=Auto, 2=HighPerfGPU
+        public int? optimusRenderingMode { get; set; }
+    }
+
     class GameConfig
     {
         public string name { get; set; }
         public string exe { get; set; }
         public string mode { get; set; }   // "Game Mode" or "Audio Mode"
         public int fanSpeed { get; set; }
+        public string priority { get; set; }        // "real time","high","above normal","normal","below normal","idle"
+        public string ioPriority { get; set; }      // "high","normal","low","very low"
+        public string cpuAffinity { get; set; }     // e.g. "0,2-11" or null=all
+        public bool noPowerThrottling { get; set; } // disable Efficiency Mode
+        // NVIDIA GPU profile override (null = no NV change)
+        public GpuProfileConfig gpuProfile { get; set; }
     }
 
     class ConfigFile
@@ -650,8 +1032,6 @@ namespace RazerTray
         public string Mode { get; set; }
         public int FanSpeed0 { get; set; }
         public int FanSpeed1 { get; set; }
-        public bool BoostEnabled { get; set; }
-        public bool AutoFanCurve { get; set; }
         public bool ManualOverride { get; set; }
         public bool GameDetectionEnabled { get; set; }
 
@@ -694,12 +1074,12 @@ namespace RazerTray
     // -----------------------------------------------------------------------
     class FanCurveController
     {
-        // Curve: <45C->3500, <55C->4000, <65C->4500, <75C->5000, >=75C->5300
+        // Quiet curve: <45C->2500, <55C->3000, <65C->4000, <75C->5000, >=75C->5300
         public ushort GetTargetRpm(float cpuTemp)
         {
-            if (cpuTemp < 45) return 3500;
-            if (cpuTemp < 55) return 4000;
-            if (cpuTemp < 65) return 4500;
+            if (cpuTemp < 45) return 2500;
+            if (cpuTemp < 55) return 3000;
+            if (cpuTemp < 65) return 4000;
             if (cpuTemp < 75) return 5000;
             return 5300;
         }
@@ -719,24 +1099,30 @@ namespace RazerTray
         PowerPlanManager _powerMgr;
         TemperatureMonitor _tempMon;
         GameDetector _gameDetector;
+        ProcessManager _processMgr;
 
         // ---- State ----
         PowerMode _currentMode = PowerMode.Balanced;
         ushort _fanSpeed0 = 0;
         ushort _fanSpeed1 = 0;
-        bool _boostEnabled = false;
         bool _isManualOverride = false;
         bool _gameModeActive = false;
         bool _gameDetectionEnabled = true;
 
-        // RPM history (max 8 per fan)
-        Dictionary<int, Queue<ushort>> _fanHistory;
-        const int MaxFanHistory = 8;
+        // Run at Startup
+        const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string RUN_REG_VALUE = "RazerTray";
+        ToolStripMenuItem _startupItem;
 
         // Cached temperatures
         float _cpuTemp = 0;
         float _gpuTemp = 0;
         DateTime _lastTempRead = DateTime.MinValue;
+
+        // GPU monitoring (NVAPI)
+        int _gpuClockMHz = 0;
+        int _gpuMemMHz = 0;
+        int _gpuUtilPercent = 0;
 
         // Icon color map
         Color _iconColor = Color.LimeGreen; // Balanced=green, Gaming=red, Creator=blue
@@ -747,15 +1133,8 @@ namespace RazerTray
         ToolStripMenuItem _modeBalanced;
         ToolStripMenuItem _modeGaming;
         ToolStripMenuItem _modeCreator;
-        ToolStripMenuItem _fan3500;
-        ToolStripMenuItem _fan4000;
-        ToolStripMenuItem _fan4500;
-        ToolStripMenuItem _fan5000;
-        ToolStripMenuItem _fanAuto;
-        ToolStripMenuItem _fanCustom;
-        ToolStripMenuItem _boostItem;
-        ToolStripMenuItem _gameDetectionItem;
-        ToolStripMenuItem _fanAutoCurveItem;
+        ToolStripMenuItem _autoDetectItem;
+        bool _ecFallback = false;
 
         // App dir (for log, state, config files)
         string _appDir;
@@ -768,7 +1147,6 @@ namespace RazerTray
 
         // Auto fan curve
         FanCurveController _curveCtrl;
-        bool _autoFanCurveEnabled = false;
         Timer _fanCurveTimer;
 
         // ---- Constructor ----
@@ -785,15 +1163,22 @@ namespace RazerTray
             // Logger, state, curve
             _logger = new AppLogger(Path.Combine(_appDir, "RazerTray.log"));
             _logger.Log("Starting RazerTray v5");
+
+            // Initialize NVAPI (gracefully degrades if unavailable)
+            NvStatus nvStatus = NvApi.Initialize();
+            if (nvStatus == NvStatus.OK)
+                _logger.Log("NVAPI initialized");
+            else
+                _logger.Log("NVAPI not available: " + nvStatus);
             _state = new PersistedState(Path.Combine(_appDir, "RazerTray.state")).Load();
             if (_state != null) ApplyState();
             _curveCtrl = new FanCurveController();
             _gameDetector = new GameDetector(
                 Path.Combine(_appDir, "game-modes.config"));
 
-            _fanHistory = new Dictionary<int, Queue<ushort>>();
-            _fanHistory[0] = new Queue<ushort>(MaxFanHistory);
-            _fanHistory[1] = new Queue<ushort>(MaxFanHistory);
+            _processMgr = new ProcessManager(_logger);
+            _processMgr.SetUserRules(_gameDetector.GetGames());
+            _processMgr.Start();
 
             // Try USB connect
             try { _device.Connect(); } catch { }
@@ -837,8 +1222,8 @@ namespace RazerTray
         {
             _menu = new ContextMenuStrip();
 
-            // --- Performance Mode submenu ---
-            var modeMenu = new ToolStripMenuItem("Performance Mode");
+            // --- Power Mode submenu (no Boost) ---
+            var modeMenu = new ToolStripMenuItem("Power Mode");
             _modeBalanced = new ToolStripMenuItem("Balanced", null, (s, e) => SetMode(PowerMode.Balanced));
             _modeGaming = new ToolStripMenuItem("Gaming", null, (s, e) => SetMode(PowerMode.Gaming));
             _modeCreator = new ToolStripMenuItem("Creator", null, (s, e) => SetMode(PowerMode.Creator));
@@ -847,47 +1232,140 @@ namespace RazerTray
             });
             _menu.Items.Add(modeMenu);
 
-            // --- Fan Speed submenu ---
-            var fanMenu = new ToolStripMenuItem("Fan Speed");
-            _fan3500 = new ToolStripMenuItem("3500 RPM", null, (s, e) => SetFanPreset(3500));
-            _fan4000 = new ToolStripMenuItem("4000 RPM", null, (s, e) => SetFanPreset(4000));
-            _fan4500 = new ToolStripMenuItem("4500 RPM", null, (s, e) => SetFanPreset(4500));
-            _fan5000 = new ToolStripMenuItem("5000 RPM", null, (s, e) => SetFanPreset(5000));
-            _fanAuto = new ToolStripMenuItem("Auto (EC)", null, (s, e) => SetFanPreset(0));
-            _fanCustom = new ToolStripMenuItem("Custom...", null, (s, e) => PromptCustomFan());
-            fanMenu.DropDownItems.AddRange(new ToolStripItem[] {
-                _fan3500, _fan4000, _fan4500, _fan5000, _fanAuto, _fanCustom
-            });
-            _menu.Items.Add(fanMenu);
+            _menu.Items.Add(new ToolStripSeparator());
 
-            // --- Boost toggle ---
-            _boostItem = new ToolStripMenuItem("Boost", null, (s, e) => ToggleBoost());
-            _menu.Items.Add(_boostItem);
+            // --- Auto-Detect (detection + process boost + trim) ---
+            _autoDetectItem = new ToolStripMenuItem("Auto-Detect", null, (s, e) => ToggleAutoDetect());
+            _autoDetectItem.Checked = _gameDetectionEnabled;
+            _menu.Items.Add(_autoDetectItem);
+
+            // --- Manage Games ---
+            _menu.Items.Add(new ToolStripMenuItem("Manage Games...", null, (s, e) => ShowGameManager()));
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            // --- Game Detection toggle ---
-            _gameDetectionItem = new ToolStripMenuItem("Game Detection", null, (s, e) => ToggleGameDetection());
-            _gameDetectionItem.Checked = _gameDetectionEnabled;
-            _menu.Items.Add(_gameDetectionItem);
-
-            // --- Auto Fan Curve toggle ---
-            _fanAutoCurveItem = new ToolStripMenuItem("Auto Fan Curve", null, (s, e) => ToggleAutoFanCurve());
-            _menu.Items.Add(_fanAutoCurveItem);
-
-            // --- Open Config ---
-            _menu.Items.Add(new ToolStripMenuItem("Open Config...", null, (s, e) => OpenConfigFile()));
-
-            // --- Reload Config ---
-            _menu.Items.Add(new ToolStripMenuItem("Reload Config", null, (s, e) => ReloadConfig()));
+            // --- Run at startup ---
+            _startupItem = new ToolStripMenuItem("Run at Startup", null, (s, e) => ToggleStartup());
+            _startupItem.Checked = IsStartupEnabled();
+            _menu.Items.Add(_startupItem);
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            // --- Exit ---
-            _menu.Items.Add(new ToolStripMenuItem("Exit", null, (s, e) => ExitApp()));
+            // --- System submenu ---
+            var sysMenu = new ToolStripMenuItem("System");
+            sysMenu.DropDownItems.Add(new ToolStripMenuItem("Apply Tweaks", null, (s, e) => ApplySystemTweaks()));
+            sysMenu.DropDownItems.Add(new ToolStripSeparator());
+            sysMenu.DropDownItems.Add(new ToolStripMenuItem("Install Scheduled Task", null, (s, e) => InstallScheduledTask()));
+            sysMenu.DropDownItems.Add(new ToolStripSeparator());
+            sysMenu.DropDownItems.Add(new ToolStripMenuItem("Exit", null, (s, e) => ExitApp()));
+            _menu.Items.Add(sysMenu);
 
             _trayIcon = new NotifyIcon();
             _trayIcon.ContextMenuStrip = _menu;
+        }
+
+        // ---- Timer resolution API (winmm) ----
+        [DllImport("winmm.dll")]
+        static extern uint timeBeginPeriod(uint uPeriod);
+        [DllImport("winmm.dll")]
+        static extern uint timeEndPeriod(uint uPeriod);
+        bool _highResTimer = false;
+
+        // Game boost: cache of suspended process IDs
+        List<int> _suspendedPids = new List<int>();
+        bool _gameBoostEnabled = false;
+
+        // ---- NtSuspendProcess / NtResumeProcess (ntdll) ----
+        [DllImport("ntdll.dll", SetLastError = true)]
+        static extern int NtSuspendProcess(IntPtr hProcess);
+        [DllImport("ntdll.dll", SetLastError = true)]
+        static extern int NtResumeProcess(IntPtr hProcess);
+
+        // ---- EmptyWorkingSet (psapi) ----
+        [DllImport("psapi.dll", SetLastError = true)]
+        static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        void SuspendProcessByName(string nameNoExt)
+        {
+            try
+            {
+                foreach (var p in Process.GetProcessesByName(nameNoExt))
+                {
+                    if (_suspendedPids.Contains(p.Id)) continue;
+                    IntPtr h = NativeProcess.OpenProcess(
+                        NativeProcess.PROCESS_SET_INFORMATION | NativeProcess.PROCESS_QUERY_LIMITED_INFORMATION,
+                        false, (uint)p.Id);
+                    if (h != IntPtr.Zero)
+                    {
+                        int ret = NtSuspendProcess(h);
+                        if (ret == 0)
+                        {
+                            _suspendedPids.Add(p.Id);
+                            _logger.Log("Suspended: " + p.ProcessName + " (PID " + p.Id + ")");
+                        }
+                        NativeProcess.CloseHandle(h);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        void ResumeSuspendedProcesses()
+        {
+            try
+            {
+                foreach (int pid in _suspendedPids)
+                {
+                    try
+                    {
+                        Process p = Process.GetProcessById(pid);
+                        IntPtr h = NativeProcess.OpenProcess(
+                            NativeProcess.PROCESS_SET_INFORMATION | NativeProcess.PROCESS_QUERY_LIMITED_INFORMATION,
+                            false, (uint)p.Id);
+                        if (h != IntPtr.Zero)
+                        {
+                            NtResumeProcess(h);
+                            NativeProcess.CloseHandle(h);
+                        }
+                    }
+                    catch { }
+                }
+                _suspendedPids.Clear();
+                _logger.Log("Resumed all suspended processes");
+            }
+            catch { }
+        }
+
+        void TrimMemory()
+        {
+            try
+            {
+                long before = GC.GetTotalMemory(false);
+                // Only trim RazerTray's own working set (not all system processes!)
+                using (var self = Process.GetCurrentProcess())
+                {
+                    IntPtr h = NativeProcess.OpenProcess(0x1F0FFF, false, (uint)self.Id);
+                    if (h != IntPtr.Zero)
+                    {
+                        EmptyWorkingSet(h);
+                        NativeProcess.CloseHandle(h);
+                    }
+                }
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                long after = GC.GetTotalMemory(false);
+                _logger.Log("Memory trimmed: " + (before - after) / 1024 + " KB freed");
+            }
+            catch { }
+        }
+
+        void SetTimerResolution(bool highRes)
+        {
+            if (highRes == _highResTimer) return;
+            if (highRes) timeBeginPeriod(1);
+            else timeEndPeriod(1);
+            _highResTimer = highRes;
+            _logger.Log("TimerResolution: " + (highRes ? "1ms" : "default"));
         }
 
         // ---- Icon ----
@@ -932,7 +1410,7 @@ namespace RazerTray
             // NotifyIcon.Text is limited to 63 chars on Windows
             StringBuilder sb = new StringBuilder();
             sb.Append(_currentMode.ToString());
-            if (_boostEnabled) sb.Append("+Boost");
+            if (_ecFallback) sb.Append("(EC)");
             sb.Append(' ');
 
             if (_device.IsConnected)
@@ -947,7 +1425,11 @@ namespace RazerTray
             if (_cpuTemp > 0)
                 sb.AppendFormat("CPU:{0:F0}C ", _cpuTemp);
             if (_gpuTemp > 0)
-                sb.AppendFormat("GPU:{0:F0}C", _gpuTemp);
+                sb.AppendFormat("GPU:{0:F0}C ", _gpuTemp);
+            if (_gpuClockMHz > 0)
+                sb.AppendFormat("{0}MHz", _gpuClockMHz);
+            if (_gpuUtilPercent > 0)
+                sb.AppendFormat(" {0}%", _gpuUtilPercent);
 
             if (_gameModeActive)
                 sb.Append(" *Game*");
@@ -987,6 +1469,9 @@ namespace RazerTray
                 default: _iconColor = Color.LimeGreen; break;
             }
 
+            // High-res timer for Gaming/Audio modes
+            SetTimerResolution(mode == PowerMode.Gaming || mode == PowerMode.Creator);
+
             // Set Windows power plan
             Guid planGuid = _powerMgr.ModeToPlanGuid(mode);
             _powerMgr.SetActivePlan(planGuid);
@@ -998,11 +1483,48 @@ namespace RazerTray
                 {
                     _device.SetModeWithFan(mode, autoFan: false, fanRpm: fanRpm.Value);
                 }
-                else
+                else if (_ecFallback)
                 {
+                    // Shift+click fallback: EC controls the fan
                     _device.SetPowerMode(mode, autoFan: true);
                 }
+                else
+                {
+                    // Smart curve with per-mode offset
+                    _device.SetPowerMode(mode, autoFan: false);
+                    ushort target = _curveCtrl.GetTargetRpm(_cpuTemp);
+                    int offset = mode == PowerMode.Gaming ? 500 :
+                                 mode == PowerMode.Creator ? 300 : 0;
+                    target = (ushort)Math.Min(target + offset, (ushort)5300);
+                    _device.SetFanSpeed(0, target);
+                    _device.SetFanSpeed(1, target);
+                    _fanSpeed0 = target;
+                    _fanSpeed1 = target;
+                }
             }
+
+            // Apply NVIDIA global profile setting
+            if (NvApi.IsAvailable)
+            {
+                NvPowerMode gpuMode;
+                switch (mode)
+                {
+                    case PowerMode.Gaming:
+                    case PowerMode.Creator:
+                        gpuMode = NvPowerMode.PreferMax;
+                        break;
+                    default:
+                        gpuMode = NvPowerMode.OptimalPower;
+                        break;
+                }
+                NvApi.SetGlobalPowerMode(gpuMode);
+            }
+
+            // Apply power-saving subparameter overrides on the active plan
+            if (mode == PowerMode.Balanced)
+                PowerPlanManager.ApplyPowerSaver();
+            else
+                PowerPlanManager.RemovePowerSaver();
 
             // Update UI state
             _modeBalanced.Checked = (mode == PowerMode.Balanced);
@@ -1027,6 +1549,7 @@ namespace RazerTray
                 default: next = PowerMode.Balanced; break;
             }
             _isManualOverride = true;
+            _ecFallback = (Control.ModifierKeys & Keys.Shift) != 0;
             ApplyMode(next);
         }
 
@@ -1034,64 +1557,113 @@ namespace RazerTray
         void SetMode(PowerMode mode)
         {
             _isManualOverride = true;
+            _ecFallback = (Control.ModifierKeys & Keys.Shift) != 0;
             ApplyMode(mode);
         }
 
-        // ---- Set fan preset ----
-        void SetFanPreset(ushort rpm)
-        {
-            if (!_device.IsConnected) return;
-
-            // Manual fan set disables auto fan curve
-            _autoFanCurveEnabled = false;
-
-            if (rpm == 0)
-            {
-                // Auto (EC control)
-                _device.SetPowerMode(_currentMode, autoFan: true);
-                _fanSpeed0 = 0;
-                _fanSpeed1 = 0;
-            }
-            else
-            {
-                _device.SetFanSpeed(0, rpm);
-                _device.SetFanSpeed(1, rpm);
-                _fanSpeed0 = rpm;
-                _fanSpeed1 = rpm;
-
-                // Track history
-                foreach (int fan in new[] { 0, 1 })
-                {
-                    var q = _fanHistory[fan];
-                    q.Enqueue(rpm);
-                    if (q.Count > MaxFanHistory) q.Dequeue();
-                }
-            }
-
-            _isManualOverride = true;
-            UpdateTooltip();
-        }
-
-        // ---- Toggle boost ----
-        void ToggleBoost()
-        {
-            _boostEnabled = !_boostEnabled;
-            _device.SetBoost(_boostEnabled);
-            _boostItem.Checked = _boostEnabled;
-            UpdateTooltip();
-        }
-
-        // ---- Toggle game detection ----
-        void ToggleGameDetection()
+        // ---- Toggle Auto-Detect (detection + process boost + trim) ----
+        void ToggleAutoDetect()
         {
             _gameDetectionEnabled = !_gameDetectionEnabled;
-            _gameDetectionItem.Checked = _gameDetectionEnabled;
+            _autoDetectItem.Checked = _gameDetectionEnabled;
+            _gameBoostEnabled = _gameDetectionEnabled; // process boost follows detection
             if (!_gameDetectionEnabled)
             {
                 _gameModeActive = false;
-                // Don't auto-revert; user switched it off manually
+                ResumeSuspendedProcesses();
             }
+            _logger.Log("AutoDetect: " + (_gameDetectionEnabled ? "ON" : "OFF"));
             UpdateTooltip();
+        }
+
+        // ---- Run at Startup (HKCU Run key) ----
+        bool IsStartupEnabled()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, false))
+                {
+                    if (key == null) return false;
+                    var val = key.GetValue(RUN_REG_VALUE) as string;
+                    return val != null && val.IndexOf("RazerTray", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        void SetStartupEnabled(bool enable)
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, true))
+                {
+                    if (key == null) return;
+                    if (enable)
+                    {
+                        string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                        key.SetValue(RUN_REG_VALUE, exePath);
+                    }
+                    else
+                    {
+                        if (key.GetValue(RUN_REG_VALUE) != null)
+                            key.DeleteValue(RUN_REG_VALUE);
+                    }
+                }
+                _logger.Log("Startup: " + (enable ? "ON" : "OFF"));
+            }
+            catch (Exception ex)
+            {
+                _logger.Log("Startup toggle failed: " + ex.Message);
+            }
+        }
+
+        void ToggleStartup()
+        {
+            bool enabled = !IsStartupEnabled();
+            SetStartupEnabled(enabled);
+            _startupItem.Checked = enabled;
+        }
+
+        // ---- Install as scheduled task (admin-elevated logon) ----
+        void InstallScheduledTask()
+        {
+            try
+            {
+                string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                string taskName = "RazerTray";
+                string cmd = string.Format("schtasks /create /tn \"{0}\" /tr \"\\\"{1}\\\"\" /sc onlogon /rl highest /f",
+                    taskName, exePath);
+                var psi = new ProcessStartInfo("cmd.exe", "/c " + cmd)
+                {
+                    UseShellExecute = true,
+                    Verb = "runas", // prompt UAC for admin
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    p.WaitForExit(5000);
+                    if (p.ExitCode == 0)
+                    {
+                        _logger.Log("Scheduled task installed: " + taskName);
+                        _trayIcon.ShowBalloonTip(3000, "RazerTray",
+                            "Scheduled task installed (runs at logon with highest privileges)",
+                            ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        _trayIcon.ShowBalloonTip(3000, "RazerTray",
+                            "Failed to install scheduled task (exit code " + p.ExitCode + ")",
+                            ToolTipIcon.Warning);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Log("InstallScheduledTask failed: " + ex.Message);
+                _trayIcon.ShowBalloonTip(3000, "RazerTray",
+                    "Failed to install scheduled task: " + ex.Message,
+                    ToolTipIcon.Error);
+            }
         }
 
         // ---- Reload config ----
@@ -1101,41 +1673,6 @@ namespace RazerTray
             _trayIcon.ShowBalloonTip(1500, "Razer Blade Tray",
                 "Config reloaded: " + _gameDetector.GetGames().Count + " games",
                 ToolTipIcon.Info);
-        }
-
-        // ---- Custom fan speed prompt ----
-        void PromptCustomFan()
-        {
-            string input = InputBox("Enter fan speed (3100-5300 RPM):", "Custom Fan Speed", "4000");
-            ushort rpm;
-            if (ushort.TryParse(input, out rpm))
-            {
-                rpm = Math.Max((ushort)3100, Math.Min((ushort)5300, rpm));
-                SetFanPreset(rpm);
-            }
-        }
-
-        // ---- Simple InputBox ----
-        static string InputBox(string prompt, string title, string defaultValue)
-        {
-            var form = new Form();
-            form.Text = title;
-            form.ClientSize = new Size(320, 120);
-            form.FormBorderStyle = FormBorderStyle.FixedDialog;
-            form.StartPosition = FormStartPosition.CenterScreen;
-            form.MinimizeBox = false;
-            form.MaximizeBox = false;
-
-            var label = new Label { Text = prompt, Left = 12, Top = 12, Width = 290 };
-            var textBox = new TextBox { Left = 12, Top = 36, Width = 290, Text = defaultValue };
-            var okBtn = new Button { Text = "OK", Left = 150, Top = 72, Width = 70, DialogResult = DialogResult.OK };
-            var cancelBtn = new Button { Text = "Cancel", Left = 230, Top = 72, Width = 70, DialogResult = DialogResult.Cancel };
-
-            form.Controls.AddRange(new Control[] { label, textBox, okBtn, cancelBtn });
-            form.AcceptButton = okBtn;
-            form.CancelButton = cancelBtn;
-
-            return form.ShowDialog() == DialogResult.OK ? textBox.Text : null;
         }
 
         // ---- Exit ----
@@ -1172,8 +1709,6 @@ namespace RazerTray
                 }
                 if (_state.FanSpeed0 > 0) _fanSpeed0 = (ushort)_state.FanSpeed0;
                 if (_state.FanSpeed1 > 0) _fanSpeed1 = (ushort)_state.FanSpeed1;
-                _boostEnabled = _state.BoostEnabled;
-                _autoFanCurveEnabled = _state.AutoFanCurve;
                 _isManualOverride = _state.ManualOverride;
                 _gameDetectionEnabled = _state.GameDetectionEnabled;
             }
@@ -1190,8 +1725,6 @@ namespace RazerTray
                 _state.Mode = _currentMode.ToString();
                 _state.FanSpeed0 = _fanSpeed0;
                 _state.FanSpeed1 = _fanSpeed1;
-                _state.BoostEnabled = _boostEnabled;
-                _state.AutoFanCurve = _autoFanCurveEnabled;
                 _state.ManualOverride = _isManualOverride;
                 _state.GameDetectionEnabled = _gameDetectionEnabled;
                 _state.Save();
@@ -1199,13 +1732,229 @@ namespace RazerTray
             catch { }
         }
 
-        // ---- Open config file in Notepad ----
-        void OpenConfigFile()
+        // ---- Show game manager dialog ----
+        void ShowGameManager()
+        {
+            string configPath = Path.Combine(_appDir, "game-modes.config");
+            var form = new GameManagerForm(configPath, () => {
+                _gameDetector.Reload();
+                _logger.Log("Config reloaded: " + _gameDetector.GetGames().Count + " games");
+            });
+            form.ShowDialog();
+        }
+
+        // ---- One-shot system registry tweaks ----
+        void ApplySystemTweaks()
         {
             try
             {
-                string configPath = Path.Combine(_appDir, "game-modes.config");
-                Process.Start("notepad.exe", configPath);
+                int ok = 0, fail = 0;
+
+                // 1. MMCSS Audio: raise scheduling to High
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Audio", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("Scheduling Category", "High", RegistryValueKind.String);
+                            k.SetValue("SFIO Priority", "High", RegistryValueKind.String);
+                            k.SetValue("GPU Priority", 8, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 2. MMCSS Games: add Latency Sensitive
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("Latency Sensitive", "True", RegistryValueKind.String);
+                            k.SetValue("SFIO Priority", "High", RegistryValueKind.String);
+                            k.SetValue("GPU Priority", 8, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 3. SystemResponsiveness = 0 (reduce background throttling)
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("SystemResponsiveness", 0, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 4. Win32PrioritySeparation: short quantums, variable, foreground boost
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SYSTEM\CurrentControlSet\Control\PriorityControl", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("Win32PrioritySeparation", 38, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 5. Network tweaks: Nagle's algorithm per interface
+                try
+                {
+                    string tcpipPath = @"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+                    using (var ifaces = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(tcpipPath))
+                    {
+                        if (ifaces != null)
+                        {
+                            foreach (var guid in ifaces.GetSubKeyNames())
+                            {
+                                using (var iface = ifaces.OpenSubKey(guid, true))
+                                {
+                                    if (iface != null)
+                                    {
+                                        iface.SetValue("TcpAckFrequency", 1, RegistryValueKind.DWord);
+                                        iface.SetValue("TcpNoDelay", 1, RegistryValueKind.DWord);
+                                    }
+                                }
+                            }
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 6. Disable NetBIOS over TCP/IP per adapter
+                try
+                {
+                    string netbtPath = @"SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces";
+                    using (var ifaces = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(netbtPath))
+                    {
+                        if (ifaces != null)
+                        {
+                            foreach (var guid in ifaces.GetSubKeyNames())
+                            {
+                                using (var iface = ifaces.OpenSubKey(guid, true))
+                                {
+                                    if (iface != null)
+                                        iface.SetValue("NetbiosOptions", 2, RegistryValueKind.DWord);
+                                }
+                            }
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 7. Disable LLMNR multicast
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(
+                        @"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"))
+                    {
+                        k.SetValue("EnableMulticast", 0, RegistryValueKind.DWord);
+                        ok++;
+                    }
+                }
+                catch { fail++; }
+
+                // 8. Disable Xbox Game Monitoring service
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SYSTEM\CurrentControlSet\Services\xbgm", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("Start", 4, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 9. Disable mouse acceleration
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                        @"Control Panel\Mouse", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("MouseSpeed", "0", RegistryValueKind.String);
+                            k.SetValue("MouseThreshold1", "0", RegistryValueKind.String);
+                            k.SetValue("MouseThreshold2", "0", RegistryValueKind.String);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+                // 10. Visual effects: adjust for best performance
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", true))
+                    {
+                        if (k != null)
+                        {
+                            k.SetValue("VisualFXSetting", 2, RegistryValueKind.DWord);
+                            ok++;
+                        }
+                    }
+                }
+                catch { fail++; }
+
+// 11. GPU Preemption tweaks (reduce GPU latency)
+                 try
+                 {
+                     using (var k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(
+                         @"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Power"))
+                     {
+                         k.SetValue("ComputePreemption", 0, RegistryValueKind.DWord);
+                         k.SetValue("DisableCudaContextPreemption", 1, RegistryValueKind.DWord);
+                         k.SetValue("EnableAsyncMidBufferPreemption", 0, RegistryValueKind.DWord);
+                         k.SetValue("EnableCEPreemption", 0, RegistryValueKind.DWord);
+                         k.SetValue("EnableMidBufferPreemption", 0, RegistryValueKind.DWord);
+                         ok++;
+                     }
+                 }
+                 catch { fail++; }
+ 
+                 // 12. Disable CPU Power Throttling
+                 try
+                 {
+                     using (var k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(
+                         @"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"))
+                     {
+                         if (k != null)
+                         {
+                             k.SetValue("PowerThrottlingOff", 1, RegistryValueKind.DWord);
+                             ok++;
+                         }
+                     }
+                 }
+                 catch { fail++; }
+
+                string msg = ok + " tweaks applied";
+                if (fail > 0) msg += ", " + fail + " failed (need admin?)";
+                _logger.Log("SystemTweaks: " + msg);
+                _trayIcon.ShowBalloonTip(3000, "System Tweaks", msg, ToolTipIcon.Info);
             }
             catch { }
         }
@@ -1215,11 +1964,16 @@ namespace RazerTray
         {
             try
             {
-                if (!_autoFanCurveEnabled) return;
+                if (_ecFallback) return; // EC in control
                 if (!_device.IsConnected) return;
                 if (_cpuTemp <= 0) return; // no temp data yet
 
                 ushort target = _curveCtrl.GetTargetRpm(_cpuTemp);
+
+                // Per-mode offset: Gaming=aggressive, Creator=moderate, Balanced=none
+                int offset = _currentMode == PowerMode.Gaming ? 500 :
+                             _currentMode == PowerMode.Creator ? 300 : 0;
+                target = (ushort)Math.Min(target + offset, (ushort)5300);
 
                 // Only set if different from current
                 if (_fanSpeed0 != target || _fanSpeed1 != target)
@@ -1228,7 +1982,7 @@ namespace RazerTray
                     _device.SetFanSpeed(1, target);
                     _fanSpeed0 = target;
                     _fanSpeed1 = target;
-                    _logger.Log("FanCurve: CPU=" + _cpuTemp.ToString("F0") + "C -> " + target + " RPM");
+                    _logger.Log("FanCurve: " + _currentMode + " CPU=" + _cpuTemp.ToString("F0") + "C -> " + target + " RPM");
                 }
             }
             catch { }
@@ -1256,41 +2010,7 @@ namespace RazerTray
             catch { }
         }
 
-        // ---- Toggle auto fan curve ----
-        void ToggleAutoFanCurve()
-        {
-            _autoFanCurveEnabled = !_autoFanCurveEnabled;
-            if (!_autoFanCurveEnabled)
-            {
-                // Restore EC auto fan control
-                _device.SetPowerMode(_currentMode, autoFan: true);
-                _logger.Log("AutoFanCurve: disabled (EC auto restored)");
-            }
-            else
-            {
-                _logger.Log("AutoFanCurve: enabled");
-            }
-            UpdateFanMenuState();
-            UpdateTooltip();
-        }
 
-        // ---- Enable/disable fan menu items based on auto fan curve state ----
-        void UpdateFanMenuState()
-        {
-            try
-            {
-                if (_fan3500 == null) return;
-                bool fanEnabled = !_autoFanCurveEnabled;
-                _fan3500.Enabled = fanEnabled;
-                _fan4000.Enabled = fanEnabled;
-                _fan4500.Enabled = fanEnabled;
-                _fan5000.Enabled = fanEnabled;
-                _fanAuto.Enabled = fanEnabled;
-                _fanCustom.Enabled = fanEnabled;
-                _fanAutoCurveItem.Checked = _autoFanCurveEnabled;
-            }
-            catch { }
-        }
 
         // ================================================================
         // Timers
@@ -1319,9 +2039,7 @@ namespace RazerTray
                 _modeBalanced.Checked = (_currentMode == PowerMode.Balanced);
                 _modeGaming.Checked = (_currentMode == PowerMode.Gaming);
                 _modeCreator.Checked = (_currentMode == PowerMode.Creator);
-                _boostItem.Checked = _boostEnabled;
 
-                UpdateFanMenuState();
                 UpdateTooltip();
             }
             catch { }
@@ -1335,6 +2053,7 @@ namespace RazerTray
                 if (!_gameDetectionEnabled) return;
 
                 _gameDetector.CheckReload();
+                _processMgr.SetUserRules(_gameDetector.GetGames());
                 var game = _gameDetector.DetectForegroundGame();
 
                 if (game != null)
@@ -1344,6 +2063,22 @@ namespace RazerTray
                     {
                         _gameModeActive = true;
                         _isManualOverride = false;
+
+                        // Game Boost: suspend background processes + trim memory
+                        if (_gameBoostEnabled)
+                        {
+                            try
+                            {
+                                SuspendProcessByName("explorer");
+                                SuspendProcessByName("chrome");
+                                SuspendProcessByName("firefox");
+                                SuspendProcessByName("msedge");
+                                SuspendProcessByName("brave");
+                                SuspendProcessByName("opera");
+                                TrimMemory();
+                            }
+                            catch { }
+                        }
 
                         PowerMode targetMode;
                         if (game.mode != null && game.mode.IndexOf("Audio", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -1356,6 +2091,25 @@ namespace RazerTray
                         ushort? fanRpm = game.fanSpeed > 0 ? (ushort?)game.fanSpeed : null;
 
                         ApplyMode(targetMode, fanRpm);
+
+                        // Apply per-game NVIDIA GPU profile if configured
+                        if (game.gpuProfile != null && NvApi.IsAvailable)
+                        {
+                            try
+                            {
+                                if (game.gpuProfile.gpuPowerMode.HasValue)
+                                {
+                                    // Try to find existing game profile by exe name
+                                    string profileName = Path.GetFileNameWithoutExtension(game.exe);
+                                    var result = NvApi.SetGameProfilePowerMode(profileName,
+                                        (NvPowerMode)game.gpuProfile.gpuPowerMode.Value);
+                                    if (result == NvStatus.OK)
+                                        _logger.Log("NVAPI: set power mode on profile " + profileName);
+                                }
+                            }
+                            catch { }
+                        }
+
                         _trayIcon.ShowBalloonTip(1500, "Game Mode",
                             "Auto-switched to " + targetMode + " for " + game.name,
                             ToolTipIcon.Info);
@@ -1367,6 +2121,11 @@ namespace RazerTray
                     if (_gameModeActive && !_isManualOverride)
                     {
                         _gameModeActive = false;
+
+                        // Resume background processes if game boost was active
+                        if (_gameBoostEnabled)
+                            ResumeSuspendedProcesses();
+
                         // Revert to balanced
                         ApplyMode(PowerMode.Balanced);
                         _trayIcon.ShowBalloonTip(1500, "Game Mode",
@@ -1385,6 +2144,15 @@ namespace RazerTray
                 _cpuTemp = _tempMon.GetCpuTemperature();
                 _gpuTemp = _tempMon.GetGpuTemperature();
                 _lastTempRead = DateTime.Now;
+
+                // Refresh GPU clocks + utilization via NVAPI
+                if (NvApi.IsAvailable)
+                {
+                    int c, m, u;
+                    if (NvApi.GetGpuClocks(out c, out m)) { _gpuClockMHz = c; _gpuMemMHz = m; }
+                    if (NvApi.GetGpuUtilization(out u)) _gpuUtilPercent = u;
+                }
+
                 FanCurveTick();
                 UpdateTooltip();
             }
@@ -1402,8 +2170,148 @@ namespace RazerTray
                 if (_iconBitmap != null) { _iconBitmap.Dispose(); _iconBitmap = null; }
                 if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; }
                 if (_device != null) { _device.Dispose(); _device = null; }
+                if (_processMgr != null) { _processMgr.Dispose(); _processMgr = null; }
+                NvApi.Shutdown();
             }
             base.Dispose(disposing);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GameManagerForm: visual game list with add/remove
+    // -----------------------------------------------------------------------
+    class GameManagerForm : Form
+    {
+        ListView _list;
+        string _configPath;
+        Action _onChanged;
+
+        public GameManagerForm(string configPath, Action onChanged)
+        {
+            _configPath = configPath;
+            _onChanged = onChanged;
+            BuildUI();
+            LoadGames();
+        }
+
+        void BuildUI()
+        {
+            Text = "Game Mode Manager";
+            ClientSize = new Size(500, 350);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+
+            _list = new ListView();
+            _list.Dock = DockStyle.Fill;
+            _list.View = View.Details;
+            _list.FullRowSelect = true;
+            _list.Columns.Add("Game", 180);
+            _list.Columns.Add("Executable", 160);
+            _list.Columns.Add("Mode", 70);
+            _list.Columns.Add("Fan", 60);
+
+            var panel = new Panel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(8) };
+            var addBtn = new Button { Text = "Add Game...", Width = 110, Height = 28 };
+            addBtn.Click += (s, e) => AddGame();
+            var removeBtn = new Button { Text = "Remove", Width = 80, Height = 28, Left = 120 };
+            removeBtn.Click += (s, e) => RemoveGame();
+            var closeBtn = new Button { Text = "Close", Width = 80, Height = 28, Left = panel.Width - 100, Anchor = AnchorStyles.Right };
+            closeBtn.Click += (s, e) => Close();
+            panel.Controls.Add(addBtn);
+            panel.Controls.Add(removeBtn);
+            panel.Controls.Add(closeBtn);
+
+            Controls.Add(_list);
+            Controls.Add(panel);
+        }
+
+        void LoadGames()
+        {
+            _list.Items.Clear();
+            var cfg = ConfigFile.Load(_configPath);
+            foreach (var g in cfg.Games)
+            {
+                var item = new ListViewItem(g.name);
+                item.SubItems.Add(g.exe);
+                item.SubItems.Add(g.mode == "Game Mode" ? "Gaming" : "Audio");
+                item.SubItems.Add(g.fanSpeed > 0 ? g.fanSpeed.ToString() : "Auto");
+                _list.Items.Add(item);
+            }
+        }
+
+        void AddGame()
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Select Game Executable";
+                dlg.Filter = "Executables (*.exe)|*.exe|All Files (*.*)|*.*";
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+
+                string exePath = dlg.FileName;
+                string exeName = Path.GetFileName(exePath);
+                string gameName = Path.GetFileNameWithoutExtension(exePath);
+
+                // Show mode picker
+                string[] modes = { "Game Mode", "Audio Mode" };
+                var modeForm = new Form();
+                modeForm.Text = "Add Game";
+                modeForm.ClientSize = new Size(300, 160);
+                modeForm.FormBorderStyle = FormBorderStyle.FixedDialog;
+                modeForm.StartPosition = FormStartPosition.CenterParent;
+                modeForm.MinimizeBox = false;
+                modeForm.MaximizeBox = false;
+
+                var nameLabel = new Label { Text = "Name:", Left = 12, Top = 12, Width = 60 };
+                var nameBox = new TextBox { Text = gameName, Left = 80, Top = 10, Width = 200 };
+                var modeLabel = new Label { Text = "Mode:", Left = 12, Top = 42, Width = 60 };
+                var modeBox = new ComboBox { Left = 80, Top = 40, Width = 200, DropDownStyle = ComboBoxStyle.DropDownList };
+                modeBox.Items.AddRange(modes);
+                modeBox.SelectedIndex = 0;
+                var okBtn = new Button { Text = "Add", Left = 130, Top = 100, Width = 70, DialogResult = DialogResult.OK };
+                var cancelBtn = new Button { Text = "Cancel", Left = 210, Top = 100, Width = 70, DialogResult = DialogResult.Cancel };
+
+                modeForm.Controls.AddRange(new Control[] { nameLabel, nameBox, modeLabel, modeBox, okBtn, cancelBtn });
+                modeForm.AcceptButton = okBtn;
+                modeForm.CancelButton = cancelBtn;
+
+                if (modeForm.ShowDialog() != DialogResult.OK) return;
+
+                gameName = nameBox.Text.Trim();
+                if (string.IsNullOrEmpty(gameName)) gameName = Path.GetFileNameWithoutExtension(exePath);
+
+                var cfg = ConfigFile.Load(_configPath);
+                cfg.Games.Add(new GameConfig
+                {
+                    name = gameName,
+                    exe = exeName,
+                    mode = modeBox.SelectedItem.ToString(),
+                    fanSpeed = 0
+                });
+                SaveConfig(cfg);
+                LoadGames();
+            }
+        }
+
+        void RemoveGame()
+        {
+            if (_list.SelectedItems.Count == 0) return;
+            var item = _list.SelectedItems[0];
+            string exe = item.SubItems[1].Text;
+
+            var cfg = ConfigFile.Load(_configPath);
+            cfg.Games.RemoveAll(g => g.exe.Equals(exe, StringComparison.OrdinalIgnoreCase));
+            SaveConfig(cfg);
+            LoadGames();
+        }
+
+        void SaveConfig(ConfigFile cfg)
+        {
+            var serializer = new JavaScriptSerializer();
+            string json = serializer.Serialize(cfg.Games);
+            File.WriteAllText(_configPath, json);
+            if (_onChanged != null) _onChanged();
         }
     }
 }

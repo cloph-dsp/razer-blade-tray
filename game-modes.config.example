@@ -1,0 +1,4 @@
+[
+  {"name":"Example Game","exe":"game.exe","mode":"Game Mode","fanSpeed":5000,"priority":"high","ioPriority":"high","cpuAffinity":null,"noPowerThrottling":true},
+  {"name":"DAW","exe":"daw.exe","mode":"Audio Mode","fanSpeed":3500,"priority":"realtime","ioPriority":"high","cpuAffinity":"0,2-11","noPowerThrottling":true}
+]

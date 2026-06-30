@@ -16,11 +16,14 @@ jobs:
       - name: Restore libusb
         shell: pwsh
         run: |
-          $url = "https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27-binaries.7z"
+          $url = "https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.7z"
           $out = "$env:TEMP\libusb.7z"
+          Write-Host "Downloading libusb from $url"
           curl.exe -sL $url -o $out
-          7z x $out -olibusb
-          copy libusb\VS2022\MS64\dll\libusb-1.0.dll libusb-1.0.dll
+          Write-Host "Extracting..."
+          7z x $out -olibusb -y | Out-Null
+          Copy-Item libusb\VS2022\MS64\dll\libusb-1.0.dll . -Force
+          Write-Host "libusb-1.0.dll ready"
 
       - name: Compile with csc
         shell: cmd
